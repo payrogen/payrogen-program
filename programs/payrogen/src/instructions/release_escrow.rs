@@ -1,104 +1,115 @@
 //! # Release Escrow Instruction Handler
 //!
-//! Distributes escrowed funds to recipients according to the stored split configuration.
-//! The buyer must sign the transaction to confirm delivery. All transfers happen
-//! atomically within a single Solana transaction — either all succeed or none do.
+//! Distributes escrowed funds to the recipients stored at creation, then
+//! closes the vault and the escrow account (rent returned to the buyer).
 //!
-//! After release, the escrow PDA is closed and rent is returned to the buyer.
+//! ## Who may release
+//! - The buyer, while the escrow is `Locked` or `Disputed` (delivery confirmed,
+//!   or buyer concedes a dispute). Rejected while the buyer's wallet is frozen.
+//! - The gateway authority, only while the escrow is `Disputed` (dispute
+//!   resolved in the seller's favour).
 //!
-//! ## Requirements Fulfilled
-//!
-//! - **Req 4.3**: Release escrowed funds to recipients on delivery confirmation.
-//! - **Req 5.1**: Buyer must be the transaction signer (delivery confirmation).
-//! - **Req 5.6**: Atomic distribution — all transfers revert if any single one fails.
+//! ## Security
+//! - `remaining_accounts[i]` must be an SPL token account owned by
+//!   `splits[i].recipient` holding `escrow.mint`; the caller cannot redirect
+//!   any share.
+//! - The vault is constrained to the escrow's PDA vault, mint, and authority.
+//! - The whole vault balance is distributed (rounding remainder to the first
+//!   entry) and the vault is closed, so no dust or rent is left behind.
 
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Transfer};
+use anchor_spl::token::{self, CloseAccount, Transfer};
 
 use crate::errors::PayRogenError;
-use crate::state::EscrowStatus;
+use crate::state::{EscrowStatus, ESCROW_SEED};
+use crate::validation::{assert_not_frozen, compute_shares, validate_recipient_token_account};
+use crate::EscrowReleased;
 
 /// Handler for the `release_escrow` instruction.
-///
-/// Validates escrow state, then distributes funds from the escrow token account
-/// to each recipient according to the stored split configuration. Closes escrow afterward.
-pub fn handler<'info>(
-    ctx: Context<'info, crate::ReleaseEscrow<'info>>,
-) -> Result<()> {
+pub fn handler<'info>(ctx: Context<'info, crate::ReleaseEscrow<'info>>) -> Result<()> {
     let escrow = &ctx.accounts.escrow;
+    let caller = ctx.accounts.authority.key();
+    let now = Clock::get()?.unix_timestamp;
 
-    // ─── Step 1: Validate escrow status ──────────────────────────────────────
-    require!(
-        escrow.status == EscrowStatus::Locked || escrow.status == EscrowStatus::Disputed,
-        PayRogenError::EscrowNotLocked
-    );
-
-    // ─── Step 2: Validate signer is the buyer ────────────────────────────────
-    require!(
-        ctx.accounts.buyer.key() == escrow.buyer,
-        PayRogenError::UnauthorizedSigner
-    );
-
-    // ─── Step 3: Validate remaining_accounts matches split_count ─────────────
-    let split_count = escrow.split_count as usize;
-    require!(
-        ctx.remaining_accounts.len() == split_count,
-        PayRogenError::InvalidRecipient
-    );
-
-    // ─── Step 4: Distribute funds per split config ───────────────────────────
-    let escrow_buyer = escrow.buyer;
-    let escrow_order_id = escrow.order_id;
-    let escrow_bump = escrow.bump;
-    let seeds: &[&[u8]] = &[
-        b"escrow",
-        escrow_buyer.as_ref(),
-        escrow_order_id.as_ref(),
-        &[escrow_bump],
-    ];
-    let signer_seeds: &[&[&[u8]]] = &[seeds];
-
-    let amount = escrow.amount;
-
-    for i in 0..split_count {
-        let split = &escrow.splits[i];
-
-        // Calculate transfer amount using u128 to prevent overflow
-        let transfer_amount = (amount as u128)
-            .checked_mul(split.basis_points as u128)
-            .unwrap()
-            .checked_div(10000)
-            .unwrap() as u64;
-
-        if transfer_amount == 0 {
-            continue;
-        }
-
-        let recipient_token_account = &ctx.remaining_accounts[i];
-
-        // Validate the recipient token account is writable
+    // ─── Authorization ───────────────────────────────────────────────────────
+    if caller == escrow.buyer {
         require!(
-            recipient_token_account.is_writable,
-            PayRogenError::InvalidRecipient
+            escrow.status == EscrowStatus::Locked || escrow.status == EscrowStatus::Disputed,
+            PayRogenError::EscrowNotLocked
         );
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.escrow_token_account.to_account_info(),
-            to: recipient_token_account.to_account_info(),
-            authority: ctx.accounts.escrow.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.key(),
-            cpi_accounts,
-            signer_seeds,
+        assert_not_frozen(
+            &ctx.accounts.buyer_freeze_account.to_account_info(),
+            &escrow.buyer,
+            now,
+        )?;
+    } else if caller == ctx.accounts.gateway_config.authority {
+        require!(
+            escrow.status == EscrowStatus::Disputed,
+            PayRogenError::EscrowNotDisputed
         );
-
-        token::transfer(cpi_ctx, transfer_amount)?;
+    } else {
+        return err!(PayRogenError::UnauthorizedSigner);
     }
 
-    // ─── Step 5: Mark as released (account will be closed by Anchor's `close` constraint)
-    let escrow = &mut ctx.accounts.escrow;
-    escrow.status = EscrowStatus::Released;
+    // ─── Validate every payout account before moving funds ───────────────────
+    let splits = escrow.active_splits();
+    require!(
+        ctx.remaining_accounts.len() == splits.len(),
+        PayRogenError::InvalidRecipient
+    );
+    for (split, account) in splits.iter().zip(ctx.remaining_accounts.iter()) {
+        validate_recipient_token_account(account, &split.recipient, &escrow.mint)?;
+    }
 
+    // ─── Distribute the full vault balance ───────────────────────────────────
+    let vault_balance = ctx.accounts.escrow_token_account.amount;
+    require!(
+        vault_balance >= escrow.amount,
+        PayRogenError::InsufficientBalance
+    );
+    let bps: Vec<u16> = splits.iter().map(|s| s.basis_points).collect();
+    let shares = compute_shares(vault_balance, &bps)?;
+
+    let buyer_key = escrow.buyer;
+    let order_id = escrow.order_id;
+    let bump = [escrow.bump];
+    let seeds: &[&[u8]] = &[ESCROW_SEED, buyer_key.as_ref(), order_id.as_ref(), &bump];
+    let signer_seeds: &[&[&[u8]]] = &[seeds];
+
+    for (share, account) in shares.iter().zip(ctx.remaining_accounts.iter()) {
+        if *share == 0 {
+            continue;
+        }
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.key(),
+            Transfer {
+                from: ctx.accounts.escrow_token_account.to_account_info(),
+                to: account.to_account_info(),
+                authority: ctx.accounts.escrow.to_account_info(),
+            },
+            signer_seeds,
+        );
+        token::transfer(cpi_ctx, *share)?;
+    }
+
+    // ─── Close the (now empty) vault; rent back to the buyer ─────────────────
+    token::close_account(CpiContext::new_with_signer(
+        ctx.accounts.token_program.key(),
+        CloseAccount {
+            account: ctx.accounts.escrow_token_account.to_account_info(),
+            destination: ctx.accounts.buyer.to_account_info(),
+            authority: ctx.accounts.escrow.to_account_info(),
+        },
+        signer_seeds,
+    ))?;
+
+    emit!(EscrowReleased {
+        escrow: ctx.accounts.escrow.key(),
+        released_by: caller,
+        amount: vault_balance,
+    });
+
+    // Escrow account is closed by Anchor's `close = buyer` constraint on exit.
+    ctx.accounts.escrow.status = EscrowStatus::Released;
     Ok(())
 }

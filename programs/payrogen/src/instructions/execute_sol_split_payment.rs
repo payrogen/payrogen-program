@@ -4,12 +4,16 @@
 //! to multiple recipients according to basis point allocations.
 //!
 //! Uses SystemProgram CPI transfers for native SOL (not SPL tokens).
-//! Same atomicity guarantees as execute_split_payment.
+//! Same atomicity and validation guarantees as `execute_split_payment`:
+//! gateway fee enforced on-chain, each `remaining_accounts[i]` must be exactly
+//! `splits[i].recipient`, frozen payers rejected, and the rounding remainder
+//! goes to the first entry so exactly `amount` lamports leave the payer.
 
 use anchor_lang::prelude::*;
+use anchor_lang::system_program::{self, Transfer};
 
 use crate::errors::PayRogenError;
-use crate::state::MAX_SPLITS;
+use crate::validation::{assert_not_frozen, compute_shares, validate_splits};
 use crate::SplitEntry;
 
 /// Handler for the `execute_sol_split_payment` instruction.
@@ -19,78 +23,49 @@ pub fn handler<'info>(
     splits: Vec<SplitEntry>,
 ) -> Result<()> {
     // ─── Input Validation ────────────────────────────────────────────────────
+    require!(amount > 0, PayRogenError::InvalidAmount);
 
-    require!(amount > 0, PayRogenError::InsufficientBalance);
-    require!(!splits.is_empty() && splits.len() <= MAX_SPLITS, PayRogenError::InvalidSplitSum);
-
-    let total_bps: u32 = splits.iter().map(|s| s.basis_points as u32).sum();
-    require!(total_bps == 10000, PayRogenError::InvalidSplitSum);
+    let config = &ctx.accounts.gateway_config;
+    validate_splits(&splits, &config.treasury, config.gateway_fee_bps, true)?;
 
     // ─── Freeze Check ────────────────────────────────────────────────────────
+    let now = Clock::get()?.unix_timestamp;
+    assert_not_frozen(
+        &ctx.accounts.freeze_account.to_account_info(),
+        &ctx.accounts.payer.key(),
+        now,
+    )?;
 
-    let freeze_info = &ctx.accounts.freeze_account;
-    if freeze_info.data_len() > 0 {
-        let data = freeze_info.try_borrow_data()?;
-        if data.len() >= crate::state::WalletFreeze::LEN {
-            let expires_at = i64::from_le_bytes(data[48..56].try_into().unwrap());
-            let clock = Clock::get()?;
-            require!(
-                expires_at < clock.unix_timestamp,
-                PayRogenError::WalletFrozen
-            );
-        }
-    }
-
-    // ─── Account Validation ──────────────────────────────────────────────────
-
+    // ─── Account Validation (all before any funds move) ──────────────────────
     require!(
         ctx.remaining_accounts.len() == splits.len(),
         PayRogenError::InvalidRecipient
     );
-
-    // Check payer has enough lamports
-    let payer_lamports = ctx.accounts.payer.lamports();
-    require!(payer_lamports >= amount, PayRogenError::InsufficientBalance);
+    require!(
+        ctx.accounts.payer.lamports() >= amount,
+        PayRogenError::InsufficientBalance
+    );
+    for (split, recipient) in splits.iter().zip(ctx.remaining_accounts.iter()) {
+        require!(recipient.is_writable, PayRogenError::InvalidRecipient);
+        require_keys_eq!(recipient.key(), split.recipient, PayRogenError::InvalidRecipient);
+    }
 
     // ─── Execute SOL Transfers ───────────────────────────────────────────────
+    let bps: Vec<u16> = splits.iter().map(|s| s.basis_points).collect();
+    let shares = compute_shares(amount, &bps)?;
 
-    for (i, split) in splits.iter().enumerate() {
-        let transfer_amount = (amount as u128)
-            .checked_mul(split.basis_points as u128)
-            .unwrap()
-            .checked_div(10000)
-            .unwrap() as u64;
-
-        if transfer_amount == 0 {
+    for (share, recipient) in shares.iter().zip(ctx.remaining_accounts.iter()) {
+        if *share == 0 {
             continue;
         }
-
-        let recipient = &ctx.remaining_accounts[i];
-
-        require!(
-            recipient.is_writable,
-            PayRogenError::InvalidRecipient
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.system_program.key(),
+            Transfer {
+                from: ctx.accounts.payer.to_account_info(),
+                to: recipient.to_account_info(),
+            },
         );
-
-        // Verify recipient matches the split entry
-        require!(
-            recipient.key() == split.recipient,
-            PayRogenError::InvalidRecipient
-        );
-
-        // CPI to SystemProgram for native SOL transfer
-        anchor_lang::solana_program::program::invoke(
-            &anchor_lang::solana_program::system_instruction::transfer(
-                &ctx.accounts.payer.key(),
-                &recipient.key(),
-                transfer_amount,
-            ),
-            &[
-                ctx.accounts.payer.to_account_info(),
-                recipient.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
+        system_program::transfer(cpi_ctx, *share)?;
     }
 
     Ok(())

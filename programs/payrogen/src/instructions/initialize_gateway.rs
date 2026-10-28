@@ -6,35 +6,29 @@
 //! ## Security
 //! - Can only be called once (Anchor's `init` constraint on the PDA prevents
 //!   re-initialization at the Solana runtime level).
-//! - The caller becomes the gateway authority (Admin_MultiSig).
+//! - Only the program's upgrade authority can call it: the accounts struct
+//!   requires the program's ProgramData account and checks that its
+//!   `upgrade_authority_address` is the signer. This closes the
+//!   deploy-then-initialize front-running window.
 //! - Fee is validated against the 500 bps maximum at initialization.
-//!
-//! ## Requirements
-//! - Must be called before any other instruction (all instructions reference gateway_config).
+//! - The signer becomes the gateway authority; rotate it to a multisig with
+//!   `propose_authority` / `accept_authority`.
 
 use anchor_lang::prelude::*;
 
 use crate::errors::PayRogenError;
-
-/// Maximum gateway fee in basis points (500 = 5%).
-const MAX_FEE_BPS: u16 = 500;
+use crate::state::MAX_FEE_BPS;
 
 /// Handler for the `initialize_gateway` instruction.
-///
-/// Creates the GatewayConfig PDA with the deployer as authority,
-/// the specified treasury wallet, and the initial fee.
-///
-/// # Arguments
-/// * `ctx` - The Anchor context containing the gateway_config account to initialize.
-/// * `gateway_fee_bps` - Initial gateway fee in basis points (must be <= 500).
-///
-/// # Errors
-/// * `PayRogenError::FeeExceedsMaximum` - If `gateway_fee_bps > 500`.
 pub fn handler(ctx: Context<crate::InitializeGateway>, gateway_fee_bps: u16) -> Result<()> {
-    // Validate initial fee does not exceed maximum
     require!(
         gateway_fee_bps <= MAX_FEE_BPS,
         PayRogenError::FeeExceedsMaximum
+    );
+    require_keys_neq!(
+        ctx.accounts.treasury.key(),
+        Pubkey::default(),
+        PayRogenError::InvalidAuthority
     );
 
     let gateway_config = &mut ctx.accounts.gateway_config;

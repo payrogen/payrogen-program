@@ -6,7 +6,7 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-payrogen = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
+payrogen = "AeJVPDMxcSvn89F5kgiita5cndcQvamEnCSvY38HeYFg"
 
 [programs.localnet]
 payrogen = "AeJVPDMxcSvn89F5kgiita5cndcQvamEnCSvY38HeYFg"
@@ -16,6 +16,8 @@ cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+# Offline LiteSVM suite against target/deploy/payrogen.so (run `anchor build` first).
+# Use `anchor run test`. Do NOT use `anchor test` with the devnet provider: it deploys.
+test = "cargo test --manifest-path programs/payrogen/Cargo.toml && cargo test --manifest-path tests-litesvm/Cargo.toml"
 
 [hooks]

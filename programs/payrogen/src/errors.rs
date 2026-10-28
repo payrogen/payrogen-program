@@ -30,8 +30,9 @@ pub enum PayRogenError {
     #[msg("Unauthorized signer for this operation")]
     UnauthorizedSigner,
 
-    /// The multi-signature authorization check failed. Required for
-    /// admin operations like fee updates.
+    /// Reserved. Not emitted by the program: multisig enforcement is done by
+    /// making `GatewayConfig.authority` (and the upgrade authority) a multisig
+    /// vault such as Squads. Kept so later error codes stay stable.
     #[msg("Invalid multi-signature authorization")]
     InvalidMultiSig,
 
@@ -61,4 +62,41 @@ pub enum PayRogenError {
     /// timed out for the requested operation.
     #[msg("Escrow has timed out")]
     EscrowTimeout,
+
+    // ── Appended variants. Never reorder or insert above this line: Anchor
+    // ── assigns codes sequentially (6000 + index) and clients map them.
+
+    /// The amount is zero.
+    #[msg("Amount must be greater than zero")]
+    InvalidAmount,
+
+    /// The split configuration does not allocate at least
+    /// `gateway_config.gateway_fee_bps` to `gateway_config.treasury`.
+    #[msg("Split does not pay the required gateway fee to the treasury")]
+    GatewayFeeNotPaid,
+
+    /// The escrow timeout is zero, negative, or above the maximum allowed.
+    #[msg("Escrow timeout must be between 1 second and 90 days")]
+    InvalidTimeout,
+
+    /// The escrow has not reached its timeout and the caller has no other
+    /// authority to perform the operation.
+    #[msg("Escrow has not timed out yet")]
+    EscrowNotTimedOut,
+
+    /// The operation requires the escrow to be in the Disputed state.
+    #[msg("Escrow is not in disputed state")]
+    EscrowNotDisputed,
+
+    /// The freeze account is not a valid WalletFreeze for this wallet.
+    #[msg("Invalid wallet freeze account")]
+    InvalidFreezeAccount,
+
+    /// The provided authority or treasury is the default (all-zero) pubkey.
+    #[msg("Invalid authority or treasury address")]
+    InvalidAuthority,
+
+    /// The seller is not one of the escrow split recipients.
+    #[msg("Seller must be one of the split recipients")]
+    SellerNotInSplits,
 }

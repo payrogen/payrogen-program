@@ -1,87 +1,171 @@
 # PayRogen Program — Audit Notes
 
 This document orients auditors to the trust model, privileged roles, invariants, and
-known assumptions of the PayRogen Solana program. It is a guide, not a guarantee —
-please verify every claim against the source.
+known limitations of the PayRogen Solana program. It is a guide, not a guarantee.
+Verify every claim against the source and reference the exact commit hash in findings.
 
 - **Framework:** Anchor `1.1.2`
-- **Program entrypoint:** `programs/payrogen/src/lib.rs`
+- **Program entrypoint and account structs:** `programs/payrogen/src/lib.rs`
 - **State:** `programs/payrogen/src/state.rs`
+- **Shared checks:** `programs/payrogen/src/validation.rs`
 - **Errors:** `programs/payrogen/src/errors.rs`
 - **Instruction handlers:** `programs/payrogen/src/instructions/`
+- **Tests:** `programs/payrogen/src/tests.rs` (unit/property), `tests-litesvm/` (end-to-end
+  against the compiled SBF binary)
 
 ## Accounts (PDAs)
 
 | Account | Seeds | Purpose |
 |---|---|---|
-| `GatewayConfig` | `[b"gateway_config"]` | Singleton. Stores `authority`, `treasury`, `gateway_fee_bps`, `bump`. |
-| `EscrowAccount` | `[b"escrow", buyer, order_id]` | Holds locked funds + split config for one order. |
-| `WalletFreeze` | `[b"freeze", wallet]` | Time-boxed freeze blocking a wallet's outgoing transfers. |
+| `GatewayConfig` | `[b"gateway_config"]` | Singleton: `authority`, `treasury`, `gateway_fee_bps`, `bump`. Fixed 75-byte layout read at fixed offsets by clients. |
+| `PendingAuthority` | `[b"pending_authority"]` | Nominee for the two-step authority rotation. |
+| `EscrowAccount` | `[b"escrow", buyer, order_id]` | Escrow state: parties, amount, status, timeout, splits, `mint`, `vault_bump`. |
+| Escrow vault (SPL token account) | `[b"vault", escrow]` | Holds escrowed tokens. Token authority = escrow PDA. Created by `create_escrow`, closed on release/refund. |
+| `WalletFreeze` | `[b"freeze", wallet]` | 24h freeze of a wallet's outgoing transfers through this program. |
 
-## Privileged roles & trust model
+## Privileged roles and trust model
 
-- **Gateway authority (`GatewayConfig.authority`, intended to be an Admin multisig).**
-  Set once at `initialize_gateway`. It is the only party that can:
-  - `update_gateway_fee` — change the fee, **capped on-chain at 500 bps (5%)**
-    (`MAX_FEE_BPS` in `update_gateway_fee.rs`); values above the cap are rejected.
-  - `freeze_wallet` — freeze a wallet for **24h (86400s)**; auto-expires with no explicit
-    unfreeze. Enforced via `has_one = authority` on `GatewayConfig`.
-  - Initiate `refund_escrow` (in addition to anyone, once the escrow has timed out).
-- **Treasury (`GatewayConfig.treasury`).** Receives the gateway's share of each split.
-  It is a stored pubkey, not a signer.
-- **Payer / Buyer.** Must sign their own payments and escrow funding.
+**Program upgrade authority.** Can replace the program code and therefore everything
+below. It must be a multisig in production. It is also the only key that can call
+`initialize_gateway`.
 
-Auditors should assume the authority is a trusted-but-constrained admin: it can set fees
-(within the cap) and freeze wallets, but **cannot** redirect or seize user funds outside
-the documented instructions, and cannot exceed the fee cap.
+**Gateway authority (`GatewayConfig.authority`).** Can:
 
-## Core invariants to verify
+- `update_gateway_fee`: change the fee, capped on-chain at 500 bps (`MAX_FEE_BPS`).
+- `set_treasury`: change the fee treasury.
+- `propose_authority`: nominate a new authority (the nominee must sign `accept_authority`).
+- `freeze_wallet`: freeze a wallet for 24h; it auto-expires.
+- Resolve a **disputed** escrow, either by `release_escrow` (pay the stored split
+  recipients) or by `refund_escrow` (return funds to the buyer).
 
-1. **Splits sum to exactly 10000 bps (100%).** Enforced in `execute_split_payment`,
-   `execute_sol_split_payment`, and `create_escrow` (`InvalidSplitSum`). There is no
-   separate fee pre-deduction — the gateway fee is one split recipient.
-2. **Atomicity.** All transfers in a split happen in one transaction; any failing CPI
-   reverts the whole transaction (no partial distribution).
-3. **Split count bound.** `MAX_SPLITS = 5`; `remaining_accounts.len()` must equal the
-   number of split entries.
-4. **Non-zero amount.** `amount > 0` is required.
-5. **Escrow uniqueness / no double-lock.** `create_escrow` uses Anchor `init`, so an
-   escrow PDA for a given `(buyer, order_id)` can only be created once.
-6. **Escrow close.** `release_escrow` and `refund_escrow` close the escrow account
-   (`close = ...`), returning rent; verify funds are fully distributed before close.
-7. **Freeze enforcement.** `execute_split_payment` / `execute_sol_split_payment` read the
-   optional `WalletFreeze` PDA and reject if `expires_at >= now` (`WalletFrozen`).
-8. **Authority gating.** `update_gateway_fee` and `freeze_wallet` use
-   `has_one = authority` against `GatewayConfig`.
+The gateway authority **cannot**:
 
-## Areas that warrant particular attention
+- move escrowed funds anywhere other than the split recipients fixed at escrow creation
+  or the buyer's own token account for the escrow mint;
+- release or refund an escrow that is not disputed;
+- move funds in direct split payments (those are signed by the payer);
+- set a fee above 5%.
 
-- **`remaining_accounts` handling** in the split instructions: ordering, writability
-  checks, and that each recipient token account corresponds to the intended split entry.
-- **Rounding** in basis-point math (`amount * bps / 10000` using `u128` intermediate):
-  confirm dust/rounding cannot be exploited or cause the sum of transfers to exceed
-  `amount`.
-- **`freeze_account` as `UncheckedAccount`** in the split instructions — manual
-  deserialization and length checks before reading `expires_at`.
-- **Escrow release authorization** — who may trigger release vs. refund, and the
-  timeout boundary condition (`timeout_at`).
-- **`init_if_needed`** on `WalletFreeze` (re-freeze path) — confirm no reinitialization
-  footgun.
+**Treasury (`GatewayConfig.treasury`).** Must receive at least `gateway_fee_bps` of
+every split payment and escrow. It is a stored pubkey, not a signer.
 
-## Known assumptions / non-goals
+**Payer / buyer.** Signs their own payments and escrow funding. The buyer confirms
+delivery with `release_escrow`.
 
-- The program trusts that recipient token accounts passed in `remaining_accounts` are
-  valid SPL token accounts for the intended mint; off-chain components (the gateway)
-  construct these. Auditors should assess the on-chain consequences of malformed inputs.
-- The admin authority is assumed to be a multisig in production; the program enforces a
-  single `authority` pubkey and does not implement multisig itself.
-- Program IDs: see `lib.rs` `declare_id!` and `Anchor.toml`.
+**Seller.** Must be one of the escrow split recipients. Can raise a dispute.
 
-## Build & test
+## Escrow lifecycle
+
+| From | Action | Who | Condition | To |
+|---|---|---|---|---|
+| — | `create_escrow` | buyer | not frozen; splits valid; timeout in (0, 90 days] | `Locked` |
+| `Locked` | `release_escrow` | buyer | buyer not frozen | closed (paid out) |
+| `Locked` | `refund_escrow` | anyone | `now >= timeout_at` | closed (refunded) |
+| `Locked` | `raise_dispute` | buyer or seller | `now < timeout_at` | `Disputed` |
+| `Disputed` | `release_escrow` | buyer or gateway authority | buyer not frozen (buyer path) | closed (paid out) |
+| `Disputed` | `refund_escrow` | gateway authority | — | closed (refunded) |
+
+A dispute suspends the permissionless timeout refund. On release or refund the whole
+vault balance is moved (including any tokens donated to the vault), the vault is closed,
+and the escrow account is closed. All rent returns to the buyer.
+
+## Core invariants
+
+1. **Splits.** 1 to 5 entries, no default pubkey, shares sum to exactly 10000 bps.
+   Zero-bps entries are allowed and receive nothing (`validation::validate_splits`).
+   Escrow splits also forbid duplicate recipients, the escrow PDA as a recipient, and
+   require the seller to be a recipient.
+2. **Gateway fee is enforced on-chain.** Entries whose recipient equals
+   `GatewayConfig.treasury` must together carry at least `gateway_fee_bps`
+   (`GatewayFeeNotPaid`). Checked in both split instructions and `create_escrow`.
+3. **Recipients are bound to the instruction data or escrow state.**
+   - SPL (`execute_split_payment`, `release_escrow`): `remaining_accounts[i]` must be
+     writable, owned by the SPL Token program, an initialized token account whose
+     owner is `splits[i].recipient` and whose mint is the payment mint (payer's mint, or
+     `escrow.mint`).
+   - SOL (`execute_sol_split_payment`): `remaining_accounts[i].key == splits[i].recipient`.
+   - Refund: destination has `token::mint = escrow.mint` and
+     `token::authority = escrow.buyer`; rent receiver must equal `escrow.buyer`.
+4. **Exact amounts.** Each share is `floor(amount * bps / 10000)` (u128 intermediate);
+   the remainder is added to the first entry, so exactly `amount` moves and no dust
+   remains (`validation::compute_shares`, property-tested).
+5. **Escrow custody.** The vault is created by the program at `[b"vault", escrow]` with
+   the escrow PDA as authority and the recorded mint. Release and refund constrain the
+   vault by seeds, bump, mint, and authority.
+6. **Atomicity.** Every payout account is validated before any transfer. Any failing
+   CPI reverts the whole transaction.
+7. **Freeze.** `validation::assert_not_frozen` accepts an empty freeze PDA; otherwise it
+   requires a program-owned `WalletFreeze` (discriminator checked) for the same wallet
+   and rejects while `now <= expires_at`. Enforced in both split instructions,
+   `create_escrow`, and buyer-initiated `release_escrow`.
+8. **Initialization.** `initialize_gateway` requires the program's ProgramData account
+   and checks `upgrade_authority_address == Some(signer)`.
+9. **Authority gating.** Fee, treasury, proposal, and freeze instructions use
+   `has_one = authority`. `accept_authority` requires the nominee's signature.
+
+## Remediation log
+
+The findings below came from an internal review of commit `fa426b8`. All are fixed in
+this revision and covered by tests in `tests-litesvm/`. The split-payment and admin
+tests were also run against a build of `fa426b8`: the H-1, H-2, M-1, M-3, and L-1 tests
+fail there, and the merchant-ui-shaped two-way payment passes on both builds. The escrow
+tests cannot run against `fa426b8` because its escrow account layout differs.
+
+| ID | Severity | Finding | Fix | Tests |
+|---|---|---|---|---|
+| C-1 | Critical | `refund_escrow` did not check the destination token account, so after timeout anyone (or the authority at any time) could take the refund. | Destination constrained to `token::authority = escrow.buyer`, `token::mint = escrow.mint`. Authority refunds limited to disputed escrows. | `timeout_refund_cannot_be_redirected`, `gateway_authority_cannot_redirect_refund`, `refund_before_timeout_is_rejected_even_for_authority` |
+| C-2 | Critical | `release_escrow` only checked that payout accounts were writable, so the buyer could pay themselves. | Each payout account must be an SPL account owned by the stored recipient with `escrow.mint`. | `release_rejects_redirected_payouts`, `authority_resolves_dispute_for_seller` |
+| C-3 | Critical | `create_escrow` accepted any token account as the vault and stored no mint. | Program-created PDA vault (`[b"vault", escrow]`, authority = escrow); `mint` stored and enforced. | `create_rejects_attacker_controlled_vault`, `create_rejects_mint_mismatch`, `release_rejects_substituted_vault` |
+| H-1 | High | `initialize_gateway` could be front-run after deployment. | Only the program upgrade authority can initialize. | `initialize_rejects_non_upgrade_authority`, `initialize_rejects_immutable_program` |
+| H-2 | High | The gateway fee was not enforced on-chain. | Treasury entries must carry at least `gateway_fee_bps`. | `spl_split_enforces_gateway_fee`, `sol_split_rejects_substitution_and_fee_bypass`, `fee_increase_rejects_stale_split`, `create_validates_splits_fee_seller_and_timeout` |
+| H-3 | High | `Disputed` was unreachable; the authority could refund any escrow at any time; docs said "auto-release". | Added `raise_dispute`; authority powers limited to disputed escrows; timeout refunds the buyer; docs aligned. | `dispute_*`, `authority_resolves_dispute_for_seller`, `buyer_can_concede_dispute` |
+| M-1 | Medium | SPL split recipients were not bound to the instruction data. | Owner and mint checks on every recipient account. | `spl_split_rejects_recipient_account_substitution`, `spl_split_rejects_wrong_mint_and_non_token_accounts` |
+| M-2 | Medium | `create_escrow` ignored freezes; freeze scope undocumented. | Freeze checked in `create_escrow` and buyer `release_escrow`; scope documented. | `create_rejects_frozen_buyer`, `frozen_buyer_cannot_release` |
+| M-3 | Medium | No way to rotate the authority or treasury. | `propose_authority` / `accept_authority` (two-step) and `set_treasury`, without changing the `GatewayConfig` layout. | `two_step_authority_rotation`, `set_treasury_is_authority_only_and_enforced` |
+| L-1 | Low | Rounding dust stayed with the payer or in the vault; the vault was never closed; donations could block closing. | Remainder to the first entry; full vault balance distributed; vault closed. | `spl_split_merchant_ui_three_way_exact_amounts`, `donated_tokens_cannot_block_release`, `prop_shares_conserve_amount` |
+| L-2 | Low | Unbounded escrow timeout. | Capped at 90 days (`InvalidTimeout`). | `create_validates_splits_fee_seller_and_timeout` |
+| L-3 | Low | Freeze state was read from raw bytes without owner or discriminator checks. | Owner, discriminator, and wallet checked; fails closed. | `spl_split_respects_freeze_and_expiry`, `sol_split_respects_freeze` |
+| Info | Info | `amount == 0` reported as `InsufficientBalance`; `seller`/`merchant` unused; `InvalidMultiSig` unused; tests did not exercise handlers. | `InvalidAmount`; seller must be a recipient and may dispute; `merchant` documented as informational; `InvalidMultiSig` kept as reserved so error codes stay stable; LiteSVM suite added. | all |
+
+## Client compatibility
+
+- `execute_split_payment` and `execute_sol_split_payment` keep their discriminators,
+  argument encoding, and account lists. Existing clients that already pass the
+  treasury entry from `GatewayConfig` and the recipients' token accounts work unchanged.
+- Clients must take the treasury from `GatewayConfig` (bytes 40..72) and the fee from
+  bytes 72..74. A transaction built before a fee increase fails with `GatewayFeeNotPaid`
+  and must be rebuilt.
+- The escrow instructions changed their account lists (mint, vault PDA, freeze PDA,
+  caller/buyer split). See the IDL.
+- New error variants were appended (codes 6010 to 6017). Existing codes 6000 to 6009 did
+  not move.
+
+## Known limitations and non-goals
+
+- **Freeze scope.** A freeze only blocks transfers through this program. The wallet
+  owner can still sign plain SPL or System transfers elsewhere.
+- **Token-2022 is not supported.** Mints and token accounts must belong to the classic
+  SPL Token program.
+- **Disputes have no on-chain deadline.** A disputed escrow waits for the gateway
+  authority (or the buyer releasing). If the authority key is lost, rotate it in advance
+  or upgrade the program.
+- **Escrow re-creation.** After an escrow is released or refunded its PDA is closed, so
+  the same `(buyer, order_id)` can be funded again. Off-chain systems must not treat the
+  PDA address alone as a permanent order record.
+- **Multisig is external.** The program enforces a single `authority` pubkey. Use a
+  multisig vault (for example Squads) as both the gateway authority and the upgrade
+  authority.
+- **Deployment.** Fixes apply only once the upgraded binary is deployed. Check the
+  deployed program's last-deployed slot against this commit before relying on them.
+
+## Build and test
 
 ```bash
-anchor build
-anchor test        # or: cargo test   (Rust unit tests in src/tests.rs)
+anchor build                                         # program + IDL
+cargo test --manifest-path programs/payrogen/Cargo.toml   # unit + property tests
+cargo test --manifest-path tests-litesvm/Cargo.toml       # end-to-end (LiteSVM)
+# or both: anchor run test
 ```
 
-Please reference the exact commit hash in any finding.
+Do not run `anchor test` with the devnet provider in `Anchor.toml`; it deploys.
+To run the LiteSVM suite against another binary, set `PAYROGEN_SO=/path/to/payrogen.so`.

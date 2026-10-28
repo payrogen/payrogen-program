@@ -22,10 +22,15 @@ if [ ! -d "$SRC/programs/payrogen" ]; then
   exit 1
 fi
 
-# --- Copy ONLY the program + workspace files (allowlist) ---
+# --- Copy ONLY the program, its tests, and workspace files (allowlist) ---
 rm -rf "$AUDIT/programs"
 cp -R "$SRC/programs" "$AUDIT/programs"
 cp "$SRC/Anchor.toml" "$SRC/Cargo.toml" "$SRC/Cargo.lock" "$AUDIT/"
+# LiteSVM end-to-end suite: manifest, lockfile, and sources only (no target/).
+rm -rf "$AUDIT/tests-litesvm"
+mkdir -p "$AUDIT/tests-litesvm"
+cp "$SRC/tests-litesvm/Cargo.toml" "$SRC/tests-litesvm/Cargo.lock" "$AUDIT/tests-litesvm/"
+cp -R "$SRC/tests-litesvm/src" "$SRC/tests-litesvm/tests" "$AUDIT/tests-litesvm/"
 
 # --- Strip noise ---
 find "$AUDIT" -name '.DS_Store' -delete
@@ -35,7 +40,7 @@ rm -rf "$AUDIT/programs/payrogen/target" "$AUDIT/target" "$AUDIT/.anchor" 2>/dev
 echo "Running secret scan..."
 HITS="$(grep -rniE \
   'BEGIN .*PRIVATE|api[_-]?key|mnemonic|secret_key|SECRET=|PASSWORD=|HELIUS|CIRCLE_API|AES256|HMAC_SIGNING' \
-  "$AUDIT/programs" "$AUDIT/Anchor.toml" 2>/dev/null | grep -v 'Cargo.lock' || true)"
+  "$AUDIT/programs" "$AUDIT/tests-litesvm" "$AUDIT/Anchor.toml" 2>/dev/null | grep -v 'Cargo.lock' || true)"
 if [ -n "$HITS" ]; then
   echo "!!! POTENTIAL SECRET DETECTED — aborting. Review before committing:" >&2
   echo "$HITS" >&2

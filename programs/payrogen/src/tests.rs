@@ -1,359 +1,225 @@
-//! # PayRogen Property-Based Tests
+//! # PayRogen Unit and Property Tests
 //!
-//! Property tests for the PayRogen Smart Contract logic using the `proptest` crate.
-//! These tests validate core invariants by testing pure logic functions in isolation,
-//! without requiring a full Anchor/Solana runtime context.
-//!
-//! ## Properties Tested
-//! - Property 3: Gateway Fee Constraint (Requirement 6.5)
-//! - Property 4: Wallet Freeze Semantics (Requirements 7.3, 7.4, 7.5, 7.6)
-//! - Property 9: Escrow Double-Lock Prevention (Requirement 19.5)
+//! These tests call the program's real validation helpers
+//! (`crate::validation`). End-to-end tests that execute every instruction
+//! handler against the compiled SBF binary live in `tests-litesvm/`.
 
 #[cfg(test)]
-mod property_tests {
+mod unit {
+    use anchor_lang::prelude::*;
     use proptest::prelude::*;
 
-    // ─── Helper Functions (Pure Logic Under Test) ────────────────────────────
+    use crate::errors::PayRogenError;
+    use crate::state::{
+        EscrowAccount, EscrowStatus, GatewayConfig, SplitConfig, WalletFreeze, MAX_SPLITS,
+    };
+    use crate::validation::{compute_shares, validate_splits};
+    use crate::SplitEntry;
 
-    /// Maximum gateway fee in basis points (500 = 5%).
-    const MAX_FEE_BPS: u16 = 500;
+    fn key(n: u8) -> Pubkey {
+        Pubkey::new_from_array([n; 32])
+    }
 
-    /// Duration of wallet freeze in seconds (24 hours).
-    const FREEZE_DURATION_SECONDS: i64 = 86400;
+    fn entry(n: u8, bps: u16) -> SplitEntry {
+        SplitEntry { recipient: key(n), basis_points: bps }
+    }
 
-    /// Validates whether a proposed gateway fee is within the allowed range.
-    /// Returns Ok(()) if fee <= 500 bps, Err otherwise.
-    ///
-    /// This mirrors the logic in `instructions/update_gateway_fee.rs`.
-    fn validate_gateway_fee(new_fee_bps: u16) -> Result<(), &'static str> {
-        if new_fee_bps <= MAX_FEE_BPS {
-            Ok(())
-        } else {
-            Err("FeeExceedsMaximum")
+    fn code(e: anchor_lang::error::Error) -> u32 {
+        match e {
+            anchor_lang::error::Error::AnchorError(a) => a.error_code_number,
+            anchor_lang::error::Error::ProgramError(p) => panic!("unexpected program error {p:?}"),
         }
     }
 
-    /// Determines whether an outgoing transfer should be allowed given freeze state.
-    /// Returns true if the transfer is ALLOWED, false if REJECTED.
-    ///
-    /// This mirrors the freeze check logic in `instructions/execute_split_payment.rs`:
-    /// `require!(freeze_account.expires_at < clock.unix_timestamp, WalletFrozen)`
-    fn is_outgoing_transfer_allowed(expires_at: i64, current_time: i64) -> bool {
-        // Transfer allowed only when freeze has expired (expires_at < current_time)
-        expires_at < current_time
+    fn expect(res: Result<()>, err: PayRogenError) {
+        let want: u32 = err.into();
+        assert_eq!(code(res.expect_err("expected error")), want);
     }
 
-    /// Incoming transfers are always allowed regardless of freeze status.
-    /// This is by design: the freeze only blocks outgoing transfers.
-    fn is_incoming_transfer_allowed(_expires_at: i64, _current_time: i64) -> bool {
-        true
+    const TREASURY: u8 = 200;
+
+    // ─── validate_splits ─────────────────────────────────────────────────────
+
+    #[test]
+    fn merchant_ui_shapes_are_accepted() {
+        // 2-way: merchant 9850 + treasury 150
+        validate_splits(&[entry(1, 9850), entry(TREASURY, 150)], &key(TREASURY), 150, true).unwrap();
+        // 3-way: seller 9350 + treasury 150 + platform 500
+        validate_splits(
+            &[entry(1, 9350), entry(TREASURY, 150), entry(2, 500)],
+            &key(TREASURY),
+            150,
+            true,
+        )
+        .unwrap();
+        // fee 0 needs no treasury entry
+        validate_splits(&[entry(1, 10_000)], &key(TREASURY), 0, true).unwrap();
     }
 
-    /// Computes the freeze expiry timestamp from the freeze activation time.
-    fn compute_freeze_expiry(frozen_at: i64) -> i64 {
-        frozen_at.saturating_add(FREEZE_DURATION_SECONDS)
+    #[test]
+    fn split_shape_rejections() {
+        let t = key(TREASURY);
+        expect(validate_splits(&[], &t, 0, true), PayRogenError::InvalidSplitSum);
+        let six: Vec<_> = (1..=6).map(|i| entry(i, if i == 1 { 5000 } else { 1000 })).collect();
+        expect(validate_splits(&six, &t, 0, true), PayRogenError::InvalidSplitSum);
+        expect(validate_splits(&[entry(1, 9999)], &t, 0, true), PayRogenError::InvalidSplitSum);
+        // Zero-bps entries are allowed (merchant-ui sends a 0-bps treasury
+        // entry when the fee is 0).
+        validate_splits(&[entry(1, 10_000), entry(TREASURY, 0)], &t, 0, true).unwrap();
+        expect(
+            validate_splits(&[entry(1, 10_000), entry(TREASURY, 0)], &t, 1, true),
+            PayRogenError::GatewayFeeNotPaid,
+        );
+        expect(
+            validate_splits(&[entry(0, 10_000)], &t, 0, true),
+            PayRogenError::InvalidRecipient,
+        );
+        expect(
+            validate_splits(&[entry(1, 5_000), entry(1, 5_000)], &t, 0, false),
+            PayRogenError::InvalidRecipient,
+        );
+        validate_splits(&[entry(1, 5_000), entry(1, 5_000)], &t, 0, true).unwrap();
+        // u16 overflow attempt: 65535 * 2 != 10000 is caught by u32 sum
+        expect(
+            validate_splits(&[entry(1, u16::MAX), entry(2, u16::MAX)], &t, 0, true),
+            PayRogenError::InvalidSplitSum,
+        );
     }
 
-    /// Represents the status of an escrow for double-lock testing.
-    #[derive(Clone, Debug, PartialEq)]
-    enum EscrowStatus {
-        Locked,
-        Released,
-        Refunded,
+    #[test]
+    fn gateway_fee_enforced() {
+        let t = key(TREASURY);
+        expect(validate_splits(&[entry(1, 10_000)], &t, 150, true), PayRogenError::GatewayFeeNotPaid);
+        expect(
+            validate_splits(&[entry(1, 9_851), entry(TREASURY, 149)], &t, 150, true),
+            PayRogenError::GatewayFeeNotPaid,
+        );
+        // Split across two treasury entries still counts.
+        validate_splits(&[entry(1, 9_850), entry(TREASURY, 100), entry(TREASURY, 50)], &t, 150, true)
+            .unwrap();
     }
 
-    /// Simulates an attempt to create a new escrow on a PDA that may already exist.
-    /// Returns Ok(()) if creation succeeds, Err if rejected due to existing escrow.
-    ///
-    /// In the actual program, Anchor's `init` constraint on PDA seeds
-    /// `[b"escrow", buyer.key(), order_id]` prevents re-initialization at the
-    /// Solana runtime level. This function models that semantic guarantee.
-    fn attempt_create_escrow(
-        existing_escrow: Option<&EscrowStatus>,
-    ) -> Result<(), &'static str> {
-        match existing_escrow {
-            Some(_) => {
-                // PDA already exists — Solana runtime rejects re-init
-                Err("EscrowAlreadyLocked")
+    // ─── compute_shares ──────────────────────────────────────────────────────
+
+    #[test]
+    fn shares_examples() {
+        assert_eq!(compute_shares(1_000_000, &[9850, 150]).unwrap(), vec![985_000, 15_000]);
+        // 20_000_003 * 150 / 10000 = 3000 (floor), 500 bps = 1_000_000 (floor)
+        assert_eq!(
+            compute_shares(20_000_003, &[9350, 150, 500]).unwrap(),
+            vec![18_700_003, 300_000, 1_000_000]
+        );
+        assert_eq!(compute_shares(1, &[9850, 150]).unwrap(), vec![1, 0]);
+        assert_eq!(compute_shares(u64::MAX, &[10_000]).unwrap(), vec![u64::MAX]);
+        assert!(compute_shares(10, &[9_000]).is_err());
+        assert!(compute_shares(10, &[]).is_err());
+    }
+
+    fn bps_strategy() -> impl Strategy<Value = Vec<u16>> {
+        // 1..=MAX_SPLITS positive shares summing to 10000.
+        prop::collection::vec(1u16..=10_000, 1..=MAX_SPLITS).prop_filter_map("sum", |mut v| {
+            let n = v.len() as u32;
+            let total: u32 = v.iter().map(|b| *b as u32).sum();
+            // Scale into 10000 keeping every entry >= 1.
+            let mut acc = 0u32;
+            for b in v.iter_mut() {
+                let scaled = ((*b as u32) * (10_000 - n) / total) + 1;
+                *b = scaled as u16;
+                acc += scaled;
             }
-            None => {
-                // No existing escrow — creation succeeds
-                Ok(())
+            if acc > 10_000 {
+                return None;
             }
-        }
+            v[0] += (10_000 - acc) as u16;
+            Some(v)
+        })
     }
-
-    // ─── Property 3: Gateway Fee Constraint ──────────────────────────────────
-    //
-    // **Validates: Requirements 6.5**
-    //
-    // For any u16 fee value, the fee update logic accepts iff fee <= 500.
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(512))]
 
-        /// Property 3: Gateway Fee Constraint
-        ///
-        /// For any arbitrary u16 value, verify that:
-        /// - Values <= 500 are accepted
-        /// - Values > 500 are rejected with FeeExceedsMaximum
-        ///
-        /// **Validates: Requirements 6.5**
+        /// Shares always sum to exactly `amount`; each non-first share is the
+        /// exact floor; the first gets floor + remainder (< number of entries).
         #[test]
-        fn prop_gateway_fee_constraint(fee in 0u16..=u16::MAX) {
-            let result = validate_gateway_fee(fee);
-
-            if fee <= MAX_FEE_BPS {
-                prop_assert!(
-                    result.is_ok(),
-                    "Fee {} should be accepted (<=500) but was rejected",
-                    fee
-                );
-            } else {
-                prop_assert!(
-                    result.is_err(),
-                    "Fee {} should be rejected (>500) but was accepted",
-                    fee
-                );
-                prop_assert_eq!(
-                    result.unwrap_err(),
-                    "FeeExceedsMaximum",
-                    "Expected FeeExceedsMaximum error for fee {}",
-                    fee
-                );
+        fn prop_shares_conserve_amount(amount in any::<u64>(), bps in bps_strategy()) {
+            let shares = compute_shares(amount, &bps).unwrap();
+            let total: u128 = shares.iter().map(|s| *s as u128).sum();
+            prop_assert_eq!(total, amount as u128);
+            let floor = |b: u16| ((amount as u128) * (b as u128) / 10_000) as u64;
+            for (i, b) in bps.iter().enumerate().skip(1) {
+                prop_assert_eq!(shares[i], floor(*b));
             }
+            let remainder = shares[0] - floor(bps[0]);
+            prop_assert!((remainder as usize) < bps.len());
+        }
+
+        /// The treasury never receives less than floor(amount * fee / 10000)
+        /// when validate_splits accepted the configuration.
+        #[test]
+        fn prop_fee_floor_guaranteed(amount in any::<u64>(), fee in 0u16..=500, extra in 0u16..=500) {
+            let treasury_bps = fee + extra;
+            let splits = [entry(1, 10_000 - treasury_bps), entry(TREASURY, treasury_bps)];
+            let splits: Vec<_> = splits.into_iter().filter(|s| s.basis_points > 0).collect();
+            validate_splits(&splits, &key(TREASURY), fee, true).unwrap();
+            let bps: Vec<u16> = splits.iter().map(|s| s.basis_points).collect();
+            let shares = compute_shares(amount, &bps).unwrap();
+            let treasury_share: u64 = splits.iter().zip(shares.iter())
+                .filter(|(s, _)| s.recipient == key(TREASURY)).map(|(_, v)| *v).sum();
+            prop_assert!(treasury_share as u128 >= (amount as u128) * (fee as u128) / 10_000);
+        }
+
+        /// Any configuration whose treasury share is below the fee is rejected.
+        #[test]
+        fn prop_underpaid_fee_rejected(fee in 1u16..=500, short in 1u16..=500) {
+            prop_assume!(short <= fee);
+            let paid = fee - short;
+            let mut splits = vec![entry(1, 10_000 - paid)];
+            if paid > 0 { splits.push(entry(TREASURY, paid)); }
+            expect(validate_splits(&splits, &key(TREASURY), fee, true), PayRogenError::GatewayFeeNotPaid);
         }
     }
 
-    // ─── Property 4: Wallet Freeze Semantics ─────────────────────────────────
-    //
-    // **Validates: Requirements 7.3, 7.4, 7.5, 7.6**
-    //
-    // Given a freeze timestamp and a transfer attempt time:
-    // - Outgoing transfers are rejected while within 24h of freeze
-    // - Outgoing transfers are allowed after 24h expires
-    // - Incoming transfers are always allowed
+    // ─── Layout guards (off-chain clients read fixed offsets) ────────────────
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+    #[test]
+    fn account_sizes_match_serialized_layout() {
+        assert_eq!(GatewayConfig::LEN, 75);
+        assert_eq!(WalletFreeze::LEN, 57);
+        assert_eq!(EscrowAccount::LEN, 366);
 
-        /// Property 4a: Outgoing transfers rejected within freeze window
-        ///
-        /// For any freeze time and any current time within the 24h window,
-        /// outgoing transfers must be rejected.
-        ///
-        /// **Validates: Requirements 7.3, 7.4**
-        #[test]
-        fn prop_freeze_rejects_outgoing_within_24h(
-            frozen_at in 0i64..=(i64::MAX - FREEZE_DURATION_SECONDS),
-            offset in 0i64..FREEZE_DURATION_SECONDS,
-        ) {
-            let expires_at = compute_freeze_expiry(frozen_at);
-            // current_time is within the freeze window: frozen_at <= current_time < expires_at
-            let current_time = frozen_at + offset;
+        let cfg = GatewayConfig { authority: key(1), treasury: key(2), gateway_fee_bps: 150, bump: 254 };
+        let mut buf = Vec::new();
+        cfg.try_serialize(&mut buf).unwrap();
+        assert_eq!(buf.len(), GatewayConfig::LEN);
+        assert_eq!(&buf[40..72], key(2).as_ref(), "treasury offset used by merchant-ui");
+        assert_eq!(u16::from_le_bytes([buf[72], buf[73]]), 150, "fee offset used by merchant-ui");
 
-            // Verify freeze expiry is exactly frozen_at + 86400
-            prop_assert_eq!(
-                expires_at,
-                frozen_at + FREEZE_DURATION_SECONDS,
-                "Freeze expiry should be frozen_at + 86400"
-            );
+        let freeze = WalletFreeze { wallet: key(3), frozen_at: 1, expires_at: 2, bump: 1 };
+        let mut buf = Vec::new();
+        freeze.try_serialize(&mut buf).unwrap();
+        assert_eq!(buf.len(), WalletFreeze::LEN);
 
-            // Outgoing must be rejected (current_time < expires_at means freeze still active)
-            let outgoing_allowed = is_outgoing_transfer_allowed(expires_at, current_time);
-            prop_assert!(
-                !outgoing_allowed,
-                "Outgoing transfer should be REJECTED at time {} (freeze expires at {})",
-                current_time,
-                expires_at
-            );
-        }
-
-        /// Property 4b: Outgoing transfers allowed after freeze expires
-        ///
-        /// For any freeze time and any current time >= expires_at,
-        /// outgoing transfers must be permitted.
-        ///
-        /// **Validates: Requirements 7.5, 7.6**
-        #[test]
-        fn prop_freeze_allows_outgoing_after_24h(
-            frozen_at in 0i64..=(i64::MAX - FREEZE_DURATION_SECONDS - 1000),
-            extra in 1i64..1000i64,
-        ) {
-            let expires_at = compute_freeze_expiry(frozen_at);
-            // current_time is after the freeze window
-            let current_time = expires_at + extra;
-
-            let outgoing_allowed = is_outgoing_transfer_allowed(expires_at, current_time);
-            prop_assert!(
-                outgoing_allowed,
-                "Outgoing transfer should be ALLOWED at time {} (freeze expired at {})",
-                current_time,
-                expires_at
-            );
-        }
-
-        /// Property 4c: Incoming transfers always allowed regardless of freeze
-        ///
-        /// For any freeze state and any point in time, incoming transfers
-        /// to a frozen wallet must always succeed.
-        ///
-        /// **Validates: Requirements 7.4**
-        #[test]
-        fn prop_freeze_always_allows_incoming(
-            frozen_at in 0i64..=(i64::MAX - FREEZE_DURATION_SECONDS),
-            current_time in i64::MIN..i64::MAX,
-        ) {
-            let expires_at = compute_freeze_expiry(frozen_at);
-
-            // Incoming transfers are always allowed
-            let incoming_allowed = is_incoming_transfer_allowed(expires_at, current_time);
-            prop_assert!(
-                incoming_allowed,
-                "Incoming transfer should ALWAYS be allowed, regardless of freeze state"
-            );
-        }
-    }
-
-    // ─── Property 9: Escrow Double-Lock Prevention ───────────────────────────
-    //
-    // **Validates: Requirements 19.5**
-    //
-    // If an escrow PDA already exists (regardless of its status), attempting
-    // to create another escrow with the same seeds must fail.
-    // Additionally, the PDA seed derivation guarantees uniqueness: same
-    // (buyer, order_id) → same PDA address.
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
-
-        /// Property 9a: Cannot create escrow when PDA already exists (Locked)
-        ///
-        /// For any existing escrow in Locked state, a second creation attempt
-        /// must be rejected and the original state must remain unchanged.
-        ///
-        /// **Validates: Requirements 19.5**
-        #[test]
-        fn prop_escrow_double_lock_rejected_locked(
-            _buyer in prop::array::uniform32(0u8..),
-            _order_id in prop::array::uniform32(0u8..),
-        ) {
-            let existing = EscrowStatus::Locked;
-
-            // Attempt to create another escrow on the same PDA
-            let result = attempt_create_escrow(Some(&existing));
-
-            // Must be rejected
-            prop_assert!(
-                result.is_err(),
-                "Double-lock on existing Locked escrow should be rejected"
-            );
-            prop_assert_eq!(
-                result.unwrap_err(),
-                "EscrowAlreadyLocked"
-            );
-
-            // State must remain unchanged (still Locked)
-            prop_assert_eq!(
-                existing,
-                EscrowStatus::Locked,
-                "Escrow state must remain unchanged after rejection"
-            );
-        }
-
-        /// Property 9b: Cannot create escrow when PDA exists in any state
-        ///
-        /// Anchor's `init` constraint rejects re-initialization regardless of
-        /// the account's current data. Even if an escrow was Released or Refunded,
-        /// the PDA still exists and cannot be re-initialized.
-        ///
-        /// **Validates: Requirements 19.5**
-        #[test]
-        fn prop_escrow_rejects_creation_on_existing_pda(
-            status_idx in 0u8..3u8,
-            _buyer in prop::array::uniform32(0u8..),
-            _order_id in prop::array::uniform32(0u8..),
-        ) {
-            let existing_status = match status_idx {
-                0 => EscrowStatus::Locked,
-                1 => EscrowStatus::Released,
-                _ => EscrowStatus::Refunded,
-            };
-
-            let original_status = existing_status.clone();
-
-            // Attempt to create escrow on existing PDA
-            let result = attempt_create_escrow(Some(&existing_status));
-
-            // Must be rejected
-            prop_assert!(
-                result.is_err(),
-                "Creation on existing PDA (status: {:?}) should be rejected",
-                original_status
-            );
-
-            // State unchanged
-            prop_assert_eq!(
-                existing_status,
-                original_status,
-                "Escrow state must be unchanged after rejected creation attempt"
-            );
-        }
-
-        /// Property 9c: Escrow creation succeeds when no PDA exists
-        ///
-        /// If no escrow PDA exists for a given (buyer, order_id) pair,
-        /// creation should succeed.
-        ///
-        /// **Validates: Requirements 19.5**
-        #[test]
-        fn prop_escrow_creation_succeeds_when_no_pda(
-            _buyer in prop::array::uniform32(0u8..),
-            _order_id in prop::array::uniform32(0u8..),
-        ) {
-            // No existing escrow
-            let result = attempt_create_escrow(None);
-
-            prop_assert!(
-                result.is_ok(),
-                "Escrow creation should succeed when no PDA exists"
-            );
-        }
-
-        /// Property 9d: PDA seed uniqueness — same inputs produce same "address"
-        ///
-        /// For any (buyer, order_id) pair, the PDA derivation is deterministic.
-        /// This means a second attempt with the same inputs will always collide
-        /// with the existing account.
-        ///
-        /// **Validates: Requirements 19.5**
-        #[test]
-        fn prop_escrow_pda_seed_deterministic(
-            buyer in prop::array::uniform32(0u8..),
-            order_id in prop::array::uniform32(0u8..),
-        ) {
-            // Simulate PDA seed computation (without actual Solana SDK)
-            // The key insight: seeds [b"escrow", buyer, order_id] are deterministic
-            let seed1 = compute_pda_seed_hash(&buyer, &order_id);
-            let seed2 = compute_pda_seed_hash(&buyer, &order_id);
-
-            prop_assert_eq!(
-                seed1,
-                seed2,
-                "Same (buyer, order_id) must always produce the same PDA seed"
-            );
-        }
-    }
-
-    /// Helper: Simulate deterministic PDA seed computation.
-    /// In the real program, `Pubkey::find_program_address` with seeds
-    /// `[b"escrow", buyer.as_ref(), order_id.as_ref()]` is used.
-    /// This function demonstrates the determinism property.
-    fn compute_pda_seed_hash(buyer: &[u8; 32], order_id: &[u8; 32]) -> Vec<u8> {
-        let mut seed = Vec::with_capacity(7 + 32 + 32);
-        seed.extend_from_slice(b"escrow");
-        seed.extend_from_slice(buyer);
-        seed.extend_from_slice(order_id);
-        seed
+        let escrow = EscrowAccount {
+            buyer: key(1),
+            seller: key(2),
+            merchant: key(3),
+            amount: 9,
+            order_id: [4; 32],
+            status: EscrowStatus::Disputed,
+            locked_at: 5,
+            timeout_at: 6,
+            split_count: 1,
+            splits: [SplitConfig { recipient: key(7), basis_points: 10_000 }; MAX_SPLITS],
+            bump: 250,
+            mint: key(8),
+            vault_bump: 251,
+        };
+        let mut buf = Vec::new();
+        escrow.try_serialize(&mut buf).unwrap();
+        assert_eq!(buf.len(), EscrowAccount::LEN);
+        assert_eq!(buf[144], 3, "status offset");
+        assert_eq!(buf[332], 250, "bump offset");
+        assert_eq!(&buf[333..365], key(8).as_ref(), "mint offset");
+        assert_eq!(buf[365], 251, "vault_bump offset");
     }
 }

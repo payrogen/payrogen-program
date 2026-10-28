@@ -1,26 +1,28 @@
 //! # Create Escrow Instruction Handler
 //!
-//! Locks a payment amount into an Escrow PDA associated with a specific `order_id`.
-//! The escrow enforces fund safety: no party can withdraw the locked funds until
-//! delivery confirmation or timeout expiry.
-//!
-//! ## Requirements Fulfilled
-//! - **Req 4.1**: Lock total payment amount in Escrow_PDA for the specific order.
-//! - **Req 4.2**: Prevent any party from withdrawing while funds are locked.
-//! - **Req 4.5**: Validate split configuration sums to exactly 10000 basis points.
-//! - **Req 19.5**: Reject double-lock attempts (enforced by Anchor's `init`).
+//! Locks a payment amount into a program-derived token vault associated with a
+//! specific `order_id`. No party can withdraw the locked funds until delivery
+//! confirmation, timeout expiry, or dispute resolution.
 //!
 //! ## Security
-//! - Validates no recipient is the system program (zero address).
-//! - Validates no duplicate recipients in split configuration.
-//! - Timeout overflow protection via `checked_add`.
+//! - The vault is created by this instruction at `[b"vault", escrow]` with the
+//!   escrow PDA as its token authority and the escrow's `mint`, so funds can
+//!   only leave through `release_escrow` / `refund_escrow`.
+//! - The buyer's source account must hold the same mint.
+//! - The mint is recorded in escrow state; every payout is checked against it.
+//! - Splits: no zero address, no duplicates, non-zero shares, sum == 10000,
+//!   treasury share >= gateway fee, and the seller must be a recipient.
+//! - Timeout is bounded to (0, 90 days].
+//! - Frozen buyers are rejected.
+//! - Double-lock prevention via Anchor `init` on the escrow PDA.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Transfer};
 
 use crate::errors::PayRogenError;
-use crate::state::{EscrowStatus, SplitConfig, MAX_SPLITS};
-use crate::SplitEntry;
+use crate::state::{EscrowStatus, SplitConfig, MAX_ESCROW_TIMEOUT_SECONDS, MAX_SPLITS};
+use crate::validation::{assert_not_frozen, validate_splits};
+use crate::{EscrowCreated, SplitEntry};
 
 /// Handler for the `create_escrow` instruction.
 pub fn handler(
@@ -30,73 +32,76 @@ pub fn handler(
     timeout_seconds: i64,
     splits: Vec<SplitEntry>,
 ) -> Result<()> {
-    let clock = Clock::get()?;
+    let now = Clock::get()?.unix_timestamp;
 
-    // ─── Step 1: Validate escrow amount ──────────────────────────────────────
-    require!(amount > 0, PayRogenError::InsufficientBalance);
+    // ─── Input validation ────────────────────────────────────────────────────
+    require!(amount > 0, PayRogenError::InvalidAmount);
+    require!(
+        timeout_seconds > 0 && timeout_seconds <= MAX_ESCROW_TIMEOUT_SECONDS,
+        PayRogenError::InvalidTimeout
+    );
 
-    // ─── Step 2: Validate timeout duration ───────────────────────────────────
-    require!(timeout_seconds > 0, PayRogenError::EscrowTimeout);
+    let config = &ctx.accounts.gateway_config;
+    validate_splits(&splits, &config.treasury, config.gateway_fee_bps, false)?;
 
-    // ─── Step 3: Validate split configuration ────────────────────────────────
-    require!(!splits.is_empty(), PayRogenError::InvalidSplitSum);
-    require!(splits.len() <= MAX_SPLITS, PayRogenError::InvalidSplitSum);
+    let seller = ctx.accounts.seller.key();
+    let merchant = ctx.accounts.merchant.key();
+    require_keys_neq!(seller, Pubkey::default(), PayRogenError::InvalidRecipient);
+    require_keys_neq!(merchant, Pubkey::default(), PayRogenError::InvalidRecipient);
+    require!(
+        splits.iter().any(|s| s.recipient == seller),
+        PayRogenError::SellerNotInSplits
+    );
+    // The escrow PDA owns the vault; naming it as a recipient would make the
+    // vault pay itself and leave a balance that blocks closing on release.
+    let escrow_key = ctx.accounts.escrow.key();
+    require!(
+        splits.iter().all(|s| s.recipient != escrow_key),
+        PayRogenError::InvalidRecipient
+    );
 
-    // Validate no zero-address recipients (security: prevent burning funds)
-    for entry in splits.iter() {
-        require!(
-            entry.recipient != Pubkey::default(),
-            PayRogenError::InvalidRecipient
-        );
-    }
+    // ─── Freeze check ────────────────────────────────────────────────────────
+    let buyer = ctx.accounts.buyer.key();
+    assert_not_frozen(&ctx.accounts.freeze_account.to_account_info(), &buyer, now)?;
 
-    // Validate no duplicate recipients (prevent configuration errors)
-    for i in 0..splits.len() {
-        for j in (i + 1)..splits.len() {
-            require!(
-                splits[i].recipient != splits[j].recipient,
-                PayRogenError::InvalidRecipient
-            );
-        }
-    }
+    require!(
+        ctx.accounts.buyer_token_account.amount >= amount,
+        PayRogenError::InsufficientBalance
+    );
 
-    // Sum must equal exactly 10000 basis points (100%)
-    let total_bps: u32 = splits.iter().map(|s| s.basis_points as u32).sum();
-    require!(total_bps == 10000, PayRogenError::InvalidSplitSum);
-
-    // ─── Step 4: Initialize escrow account state ─────────────────────────────
-    let escrow = &mut ctx.accounts.escrow;
-
-    escrow.buyer = ctx.accounts.buyer.key();
-    escrow.seller = ctx.accounts.seller.key();
-    escrow.merchant = ctx.accounts.merchant.key();
-    escrow.amount = amount;
-    escrow.order_id = order_id;
-    escrow.status = EscrowStatus::Locked;
-    escrow.locked_at = clock.unix_timestamp;
-    escrow.timeout_at = clock
-        .unix_timestamp
-        .checked_add(timeout_seconds)
-        .ok_or(PayRogenError::EscrowTimeout)?;
-    escrow.bump = ctx.bumps.escrow;
-
-    // Store validated split configuration
-    escrow.split_count = splits.len() as u8;
-
+    // ─── Initialize escrow state ─────────────────────────────────────────────
     let mut stored_splits = [SplitConfig {
         recipient: Pubkey::default(),
         basis_points: 0,
     }; MAX_SPLITS];
-
-    for (i, entry) in splits.iter().enumerate() {
-        stored_splits[i] = SplitConfig {
+    for (slot, entry) in stored_splits.iter_mut().zip(splits.iter()) {
+        *slot = SplitConfig {
             recipient: entry.recipient,
             basis_points: entry.basis_points,
         };
     }
-    escrow.splits = stored_splits;
 
-    // ─── Step 5: Transfer SPL tokens to escrow ───────────────────────────────
+    let timeout_at = now
+        .checked_add(timeout_seconds)
+        .ok_or(PayRogenError::InvalidTimeout)?;
+    let mint = ctx.accounts.mint.key();
+
+    let escrow = &mut ctx.accounts.escrow;
+    escrow.buyer = buyer;
+    escrow.seller = seller;
+    escrow.merchant = merchant;
+    escrow.amount = amount;
+    escrow.order_id = order_id;
+    escrow.status = EscrowStatus::Locked;
+    escrow.locked_at = now;
+    escrow.timeout_at = timeout_at;
+    escrow.split_count = splits.len() as u8;
+    escrow.splits = stored_splits;
+    escrow.bump = ctx.bumps.escrow;
+    escrow.mint = mint;
+    escrow.vault_bump = ctx.bumps.escrow_token_account;
+
+    // ─── Lock funds in the vault ─────────────────────────────────────────────
     let transfer_ctx = CpiContext::new(
         ctx.accounts.token_program.key(),
         Transfer {
@@ -106,6 +111,16 @@ pub fn handler(
         },
     );
     token::transfer(transfer_ctx, amount)?;
+
+    emit!(EscrowCreated {
+        escrow: ctx.accounts.escrow.key(),
+        buyer,
+        seller,
+        mint,
+        amount,
+        order_id,
+        timeout_at,
+    });
 
     Ok(())
 }
