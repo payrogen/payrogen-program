@@ -24,3 +24,7 @@ node_modules
 *.swp
 .idea
 .vscode
+
+# Private, reference-only remediation notes — never publish
+SECURITY-AUDIT.md
+**/SECURITY-AUDIT.md

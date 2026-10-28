@@ -36,6 +36,11 @@ cp -R "$SRC/tests-litesvm/src" "$SRC/tests-litesvm/tests" "$AUDIT/tests-litesvm/
 find "$AUDIT" -name '.DS_Store' -delete
 rm -rf "$AUDIT/programs/payrogen/target" "$AUDIT/target" "$AUDIT/.anchor" 2>/dev/null || true
 
+# --- Strip private, reference-only docs that must NOT be published ---
+# SECURITY-AUDIT.md is the owner's private remediation notes (deploy steps,
+# internal caveats). It lives in the monorepo for reference but never ships.
+rm -f "$AUDIT/programs/payrogen/SECURITY-AUDIT.md"
+
 # --- Safety gate: scan for anything sensitive before you commit ---
 echo "Running secret scan..."
 HITS="$(grep -rniE \
