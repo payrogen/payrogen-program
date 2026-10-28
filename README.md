@@ -70,6 +70,11 @@ anchor test
 cargo test
 ```
 
+## For auditors
+
+- **[AUDIT.md](AUDIT.md)** — trust model, privileged roles, invariants, and areas to focus on.
+- **[SECURITY.md](SECURITY.md)** — how to report vulnerabilities (private disclosure + safe harbor).
+
 ## Security notes for auditors
 
 - Split basis points are validated on-chain to sum to exactly `10000`.
